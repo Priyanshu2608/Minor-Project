@@ -26,6 +26,21 @@ export default function PDUPage() {
 
   const [filter, setFilter] = useState("all");
 
+  const stateBreakdown = [
+    {
+      name: "Active",
+      value: mockSessions.filter((session) => session.state === "active").length,
+      color: "bg-green-400",
+    },
+    {
+      name: "Inactive",
+      value: mockSessions.filter((session) => session.state === "inactive").length,
+      color: "bg-yellow-400",
+    },
+  ];
+
+  const maxStateValue = Math.max(...stateBreakdown.map((item) => item.value), 1);
+
   const filtered = mockSessions.filter((s) =>
     filter === "all" ? true : s.state === filter
   );
@@ -62,6 +77,31 @@ export default function PDUPage() {
           value={mockSessions.filter(s => s.state === "inactive").length}
         />
         <StatCard title="Unique Slices" value="2" />
+      </div>
+
+      {/* Session State Graph */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <h2 className="text-lg font-semibold text-cyan-400 mb-5">
+          Session State Distribution
+        </h2>
+
+        <div className="h-44 flex items-end gap-6">
+          {stateBreakdown.map((item) => {
+            const height = (item.value / maxStateValue) * 100;
+
+            return (
+              <div key={item.name} className="flex-1 h-full flex flex-col items-center justify-end gap-2">
+                <div className="w-full bg-slate-800 rounded-t-md h-full flex items-end">
+                  <div
+                    className={`${item.color} w-full rounded-t-md`}
+                    style={{ height: `${height}%` }}
+                  />
+                </div>
+                <span className="text-xs text-slate-300">{item.name} ({item.value})</span>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Table */}

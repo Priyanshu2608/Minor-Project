@@ -45,6 +45,32 @@ export default function GNBPage() {
         />
       </div>
 
+      {/* Connected UEs Graph */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <h2 className="text-lg font-semibold text-cyan-400 mb-5">
+          Connected UEs per gNB
+        </h2>
+
+        <div className="h-44 flex items-end gap-4">
+          {mockGNBs.map((gnb) => {
+            const maxUes = Math.max(...mockGNBs.map((item) => item.connectedUEs), 1);
+            const height = (gnb.connectedUEs / maxUes) * 100;
+
+            return (
+              <div key={gnb.gnbId} className="flex-1 h-full flex flex-col items-center justify-end gap-2">
+                <div className="w-full bg-slate-800 rounded-t-md h-full flex items-end">
+                  <div
+                    className="w-full bg-cyan-400 rounded-t-md"
+                    style={{ height: `${height}%` }}
+                  />
+                </div>
+                <span className="text-[11px] text-slate-400">{gnb.gnbId}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       {/* gNB Table */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
         <table className="w-full text-left text-sm">
