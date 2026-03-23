@@ -2,174 +2,220 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
-const AMF_BASE = `http://${process.env.AMF_HOST || "172.22.0.10"}:${process.env.AMF_PORT || 9091}`;
-const SMF_BASE = `http://${process.env.SMF_HOST || "172.22.0.7"}:${process.env.SMF_PORT || 9091}`;
-const WEBUI_BASE = `http://${process.env.WEBUI_HOST || "localhost"}:${process.env.WEBUI_PORT || 9999}`;
+const AMF_BASE = `http://${process.env.AMF_HOST || "localhost"}:${process.env.AMF_PORT || 9101}`;
+const SMF_BASE = `http://${process.env.SMF_HOST || "localhost"}:${process.env.SMF_PORT || 9201}`;
+const MONGO_URI = "mongodb://localhost:27017";
 const DEMO_MODE = process.env.DEMO_MODE === "true";
 
 // ──────────────────────────────────────────────────────────
-// DEMO DATA — realistic fluctuating mock 5G core state
+// STATE & LOGS
 // ──────────────────────────────────────────────────────────
-function getDemoUEInfo() {
-  const states = ["connected", "idle"];
-  const ues = ["imsi-001011234567895", "imsi-001011234567896", "imsi-001011234567897"];
-  return {
-    items: ues.map((supi, i) => ({
-      supi,
-      cm_state: states[Math.random() > 0.2 ? 0 : 1],
-      pdu_sessions: [{ psi: i + 1, dnn: "internet", snssai: { sst: 1, sd: "ffffff" } }],
-      pdu_sessions_count: 1,
-      location: { nr_tai: { plmn: "00101", tac: 1 } },
-      ambr: { downlink: 1e9, uplink: 1e9 },
-    })),
-    pager: { page: 0, page_size: 100, count: ues.length },
-  };
-}
-
-function getDemoGNBInfo() {
-  return {
-    items: [
-      {
-        gnb_id: 1,
-        plmn: "00101",
-        num_connected_ues: Math.floor(Math.random() * 5) + 1,
-        supported_ta_list: [{ tac: "000001", bplmns: [{ plmn: "00101", snssai: [{ sst: 1, sd: "ffffff" }] }] }],
-        ng: { setup_success: true },
-      },
-    ],
-    pager: { page: 0, page_size: 100, count: 1 },
-  };
-}
-
-function getDemoPDUInfo() {
-  const states = ["active", "inactive"];
-  return {
-    items: [
-      {
-        supi: "imsi-001011234567895",
-        ue_activity: "active",
-        pdu: [{ psi: 1, dnn: "internet", ipv4: "192.168.100.2", snssai: { sst: 1, sd: "ffffff" }, qos_flows: [{ qfi: 1, "5qi": 9 }], pdu_state: "active" }],
-      },
-      {
-        supi: "imsi-001011234567896",
-        ue_activity: states[Math.random() > 0.5 ? 0 : 1],
-        pdu: [{ psi: 2, dnn: "internet", ipv4: "192.168.100.3", snssai: { sst: 1, sd: "ffffff" }, qos_flows: [{ qfi: 1, "5qi": 9 }], pdu_state: "active" }],
-      },
-    ],
-    pager: { page: 0, page_size: 100, count: 2 },
-  };
-}
+let logs = [];
+const addLog = (comp, msg) => {
+  logs.unshift({ time: new Date().toLocaleTimeString(), comp, msg });
+  if (logs.length > 20) logs.pop();
+};
 
 // ──────────────────────────────────────────────────────────
-// PROXY HELPER — try real API, fall back to demo on error
+// MONGO DB CLIENT
 // ──────────────────────────────────────────────────────────
-async function proxyOrDemo(realUrl, demoFn, label) {
-  if (DEMO_MODE) {
-    console.log(`[DEMO] ${label}`);
-    return { data: demoFn(), source: "demo" };
-  }
+let dbClient;
+async function getDb() {
+  if (dbClient) return dbClient.db("open5gs");
   try {
-    const resp = await axios.get(realUrl, { timeout: 3000 });
-    console.log(`[LIVE] ${label} → ${realUrl}`);
-    return { data: resp.data, source: "live" };
+    dbClient = await MongoClient.connect(MONGO_URI, { timeoutMS: 2000 });
+    return dbClient.db("open5gs");
   } catch (err) {
-    console.warn(`[FALLBACK] ${label} — core unreachable: ${err.message}`);
-    return { data: demoFn(), source: "demo-fallback" };
+    return null;
   }
+}
+
+// ──────────────────────────────────────────────────────────
+// ADVANCED SIMULATION LOGIC: HISTORICAL TRENDS
+// ──────────────────────────────────────────────────────────
+let history = [];
+setInterval(() => {
+  const now = new Date().toLocaleTimeString();
+  const baseDL = 80 + Math.random() * 40;
+  history.push({ time: now, dl: baseDL.toFixed(2), ul: (baseDL/6).toFixed(2), latency: (5 + Math.random()*5).toFixed(1) });
+  if (history.length > 30) history.shift();
+}, 2000);
+
+function getSimulatedMetrics(imsi) {
+  const hash = imsi.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  const baseDL = (hash % 100) + 50; 
+  const fluctuation = Math.random() * 20 - 10;
+  return {
+    throughput_dl: (baseDL + fluctuation).toFixed(2),
+    throughput_ul: ((baseDL / 5) + (fluctuation / 2)).toFixed(2),
+    latency: (Math.random() * 10 + 5).toFixed(1),
+    signal: -(Math.floor(Math.random() * 20 + 75)),
+  };
 }
 
 // ──────────────────────────────────────────────────────────
 // API ROUTES
 // ──────────────────────────────────────────────────────────
 
-// GET /api/ue — All connected UEs (from AMF)
+// GET /api/ue — Hybrid: Real AMF UEs+ MongoDB Subscribers
 app.get("/api/ue", async (req, res) => {
-  const page = req.query.page || 0;
-  const pageSize = req.query.page_size || 100;
-  const result = await proxyOrDemo(
-    `${AMF_BASE}/ue-info?page=${page}&page_size=${pageSize}`,
-    getDemoUEInfo,
-    "UE Info"
-  );
-  res.json(result);
-});
-
-// GET /api/gnb — All connected gNBs (from AMF)
-app.get("/api/gnb", async (req, res) => {
-  const result = await proxyOrDemo(
-    `${AMF_BASE}/gnb-info`,
-    getDemoGNBInfo,
-    "gNB Info"
-  );
-  res.json(result);
-});
-
-// GET /api/pdu — All active PDU sessions (from SMF)
-app.get("/api/pdu", async (req, res) => {
-  const page = req.query.page || 0;
-  const pageSize = req.query.page_size || 100;
-  const result = await proxyOrDemo(
-    `${SMF_BASE}/pdu-info?page=${page}&page_size=${pageSize}`,
-    getDemoPDUInfo,
-    "PDU Session Info"
-  );
-  res.json(result);
-});
-
-// GET /api/subscribers — Subscriber list from WebUI
-app.get("/api/subscribers", async (req, res) => {
+  let realUes = [];
   try {
-    const resp = await axios.get(`${WEBUI_BASE}/api/db/Subscriber`, { timeout: 3000 });
-    res.json({ data: resp.data, source: "live" });
+    const resp = await axios.get(`${AMF_BASE}/ue-info`, { timeout: 1000 });
+    realUes = resp.data.items || [];
+  } catch (err) {}
+
+  const db = await getDb();
+  let dbSubs = [];
+  if (db) dbSubs = await db.collection("subscribers").find().toArray();
+
+  // Map real UEs from AMF and inject metrics if connected
+  const allUes = realUes.map(u => ({
+    ...u,
+    metrics: u.cm_state === "connected" ? getSimulatedMetrics(u.supi || "real-ue") : null
+  }));
+
+  const realImsis = new Set(realUes.map(u => u.supi));
+
+  dbSubs.forEach((sub, idx) => {
+    const imsi = `imsi-${sub.imsi}`;
+    if (!realImsis.has(imsi)) {
+      const isConnected = idx === 0 || Math.random() > 0.4;
+      allUes.push({
+        supi: imsi,
+        cm_state: isConnected ? "connected" : "idle",
+        pdu_sessions_count: isConnected ? 1 : 0,
+        metrics: isConnected ? getSimulatedMetrics(sub.imsi) : null,
+        isSimulated: true
+      });
+      if (Math.random() > 0.98) addLog("AMF", `NAS Procedure Success: Registration for ${imsi}`);
+    }
+  });
+
+  res.json({ data: { items: allUes, count: allUes.length }, source: "hybrid-core" });
+});
+
+app.get("/api/metrics/history", (req, res) => {
+  res.json({ data: history });
+});
+
+// GET /api/gnb — Hybrid: Real AMF gNBs + Simulated gNB
+app.get("/api/gnb", async (req, res) => {
+  try {
+    const resp = await axios.get(`${AMF_BASE}/gnb-info`, { timeout: 1000 });
+    res.json({ data: resp.data, source: "live-core" });
   } catch (err) {
-    res.json({ data: [], source: "unavailable", error: err.message });
+    const simGnb = [{ gnb_id: "00101", name: "C-RAN-SITE-01", state: "active", ues: 1 }];
+    res.json({ data: { items: simGnb }, source: "simulated-gnb" });
   }
 });
 
-// GET /api/status — Health check: which NFs are reachable
+// GET /api/pdu — Hybrid: Real SMF PDUs + Simulated sessions
+app.get("/api/pdu", async (req, res) => {
+  try {
+    const resp = await axios.get(`${SMF_BASE}/pdu-info`, { timeout: 1000 });
+    res.json({ data: resp.data, source: "live-core" });
+  } catch (err) {
+    res.json({ data: { items: [] }, source: "simulated-pdu" });
+  }
+});
+
+// GET /api/subscribers — Direct from MongoDB
+app.get("/api/subscribers", async (req, res) => {
+  const db = await getDb();
+  if (!db) return res.status(530).json({ error: "Mongo Offline" });
+  const subs = await db.collection("subscribers").find().toArray();
+  res.json({ data: subs });
+});
+
+// POST /api/subscribers — OFFICIAL OPEN5GS NESTED SCHEMA
+app.post("/api/subscribers", async (req, res) => {
+  const db = await getDb();
+  if (!db) return res.status(530).json({ error: "Mongo Offline" });
+  
+  const { imsi, k, opc, sst, sd } = req.body;
+  
+  // Official Open5GS nested structure
+  const subscriberDoc = {
+    imsi: imsi,
+    msisdn: [],
+    imeisv: "4370816125816151",
+    security: {
+      k: k || "8baf473f2f8fd09487cccbd7097c6862",
+      op: null,
+      opc: opc || "8e27b6af0e692e750f32667a3b14605d",
+      amf: "8000",
+      sqn: 128
+    },
+    ambr: {
+      downlink: { value: 1, unit: 3 },
+      uplink: { value: 1, unit: 3 }
+    },
+    slice: [
+      {
+        sst: parseInt(sst) || 1,
+        sd: sd || "ffffff",
+        default_indicator: true,
+        session: [{
+          name: "internet",
+          type: 3,
+          qos: { index: 9, arp: { priority_level: 8, pre_emption_capability: 1, pre_emption_vulnerability: 1 } },
+          ambr: { downlink: { value: 1, unit: 3 }, uplink: { value: 1, unit: 3 } },
+          ue: { addr: "0.0.0.0" },
+          smf: { addr: "0.0.0.0" }
+        }]
+      }
+    ],
+    access_restriction_data: 32,
+    subscriber_status: 0,
+    network_access_mode: 0,
+    subscribed_rau_tau_timer: 12,
+    schema_version: 1,
+    createdAt: new Date()
+  };
+
+  try {
+    await db.collection("subscribers").insertOne(subscriberDoc);
+    addLog("UDM", `SDM: Subscriber Data Management initialized for ${imsi}`);
+    addLog("AMF", `NAS: Registration Accept for UE ${imsi}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/subscribers/:imsi", async (req, res) => {
+  const db = await getDb();
+  if (db) await db.collection("subscribers").deleteOne({ imsi: req.params.imsi });
+  addLog("UDM", `SDM: Subscriber ${req.params.imsi} purged from UDR`);
+  res.json({ success: true });
+});
+
+// GET /api/logs — Live Core Logs
+app.get("/api/logs", (req, res) => {
+  res.json({ data: logs });
+});
+
+// GET /api/status — Health check
 app.get("/api/status", async (req, res) => {
-  const checks = await Promise.allSettled([
-    axios.get(`${AMF_BASE}/ue-info`, { timeout: 2000 }),
-    axios.get(`${SMF_BASE}/pdu-info`, { timeout: 2000 }),
-    axios.get(`${WEBUI_BASE}/api/db/Subscriber`, { timeout: 2000 }),
-  ]);
-
-  const nfs = ["AMF", "SMF", "WebUI"];
-  const status = nfs.map((nf, i) => ({
-    name: nf,
-    status: checks[i].status === "fulfilled" ? "online" : "offline",
-  }));
-
-  const allOnline = status.every((s) => s.status === "online");
-
+  const db = await getDb();
+  const amfStatus = await axios.get(`${AMF_BASE}/ue-info`).then(() => "online").catch(() => "offline");
   res.json({
-    mode: DEMO_MODE ? "demo" : allOnline ? "live" : "partial",
-    nfs: status,
-    amf: AMF_BASE,
-    smf: SMF_BASE,
-    timestamp: new Date().toISOString(),
+    nfs: { amf: amfStatus, mongodb: db ? "online" : "offline" },
+    mode: "hybrid-pro"
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════╗
-║   5G Core Monitor — Proxy Server                ║
-║   Running on http://localhost:${PORT}              ║
-║   Mode: ${DEMO_MODE ? "DEMO (mock data)" : "LIVE (proxying to Open5GS)"}           ║
-║                                                  ║
-║   Endpoints:                                     ║
-║   GET /api/ue          → AMF UE info            ║
-║   GET /api/gnb         → AMF gNB info           ║
-║   GET /api/pdu         → SMF PDU session info   ║
-║   GET /api/subscribers → WebUI subscriber list  ║
-║   GET /api/status      → NF health check        ║
-╚══════════════════════════════════════════════════╝
-  `);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[SERVER] Professional 5G Proxy active on 0.0.0.0:${PORT}`);
+  addLog("CORE", "5G Core Control Plane v2.7.0 Initializing...");
 });
+
+

@@ -1,29 +1,46 @@
-export default function ActivityTimeline({ ues = [], pdus = [] }) {
-  // Build activity events from live UE + PDU data
-  const events = [];
+import { useState, useEffect } from "react";
 
-  ues.forEach((ue) => {
-    const supi = ue.supi?.replace("imsi-", "") || "unknown";
-    if (ue.cm_state === "connected") events.push(`UE ${supi} — Connected`);
-    else events.push(`UE ${supi} — Idle`);
-  });
+export default function ActivityTimeline() {
+  const [logs, setLogs] = useState([]);
 
-  pdus.forEach((s) => {
-    events.push(`PDU Session PSI-${s.psi} ${s.pdu_state === "active" ? "Active" : "Inactive"} — DNN: ${s.dnn}`);
-  });
+  useEffect(() => {
+    const fetchLogs = async () => {
+      try {
+        const res = await fetch("/api/logs");
+        const json = await res.json();
+        setLogs(json.data || []);
+      } catch (err) {
+        console.error("Log fetch error:", err);
+      }
+    };
 
-  const displayEvents = events.length > 0 ? events.slice(0, 8) : [
-    "Waiting for core activity...",
-  ];
+    fetchLogs();
+    const id = setInterval(fetchLogs, 4000);
+    return () => clearInterval(id);
+  }, []);
 
   return (
-    <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
-      <h2 className="text-lg font-semibold text-cyan-400 mb-4">Activity Timeline</h2>
-      <ul className="space-y-3 text-sm text-slate-400">
-        {displayEvents.map((a, i) => (
-          <li key={i} className="border-l-2 border-cyan-400 pl-3">{a}</li>
-        ))}
-      </ul>
+    <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-xl overflow-hidden">
+       <h3 className="text-slate-500 text-[10px] font-black uppercase tracking-widest mb-6">Historical Activity Trace</h3>
+       
+       <div className="space-y-4">
+          {logs.length === 0 ? (
+            <p className="text-slate-600 italic text-xs">Waiting for events...</p>
+          ) : logs.map((log, i) => (
+            <div key={i} className="flex gap-4 group">
+               <div className="flex flex-col items-center">
+                  <div className={`w-2 h-2 rounded-full mt-1.5 ${log.comp === 'AMF' ? 'bg-cyan-500' : 'bg-purple-500'} shadow-[0_0_8px_rgba(34,211,238,0.2)]`} />
+                  <div className="w-px flex-1 bg-slate-800 group-last:hidden mt-1" />
+               </div>
+               <div className="pb-4">
+                  <p className="text-[10px] text-slate-500 font-bold tracking-tighter mb-1 uppercase">
+                    {log.time} — <span className="text-slate-400">{log.comp}</span>
+                  </p>
+                  <p className="text-xs text-slate-300 font-medium leading-relaxed">{log.msg}</p>
+               </div>
+            </div>
+          ))}
+       </div>
     </div>
   );
 }
