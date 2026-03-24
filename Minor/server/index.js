@@ -26,13 +26,21 @@ const addLog = (comp, msg) => {
 // ──────────────────────────────────────────────────────────
 // MONGO DB CLIENT
 // ──────────────────────────────────────────────────────────
-let dbClient;
+// ──────────────────────────────────────────────────────────
+// MONGO DB CLIENT
+// ──────────────────────────────────────────────────────────
+const client = new MongoClient(MONGO_URI);
+let db;
+
 async function getDb() {
-  if (dbClient) return dbClient.db("open5gs");
+  if (db) return db;
   try {
-    dbClient = await MongoClient.connect(MONGO_URI, { timeoutMS: 2000 });
-    return dbClient.db("open5gs");
+    await client.connect();
+    db = client.db("open5gs");
+    console.log("[MONGO] Connected to open5gs database");
+    return db;
   } catch (err) {
+    console.error("[MONGO] Connection failed:", err.message);
     return null;
   }
 }
@@ -72,9 +80,9 @@ app.get("/api/ue", async (req, res) => {
     realUes = resp.data.items || [];
   } catch (err) {}
 
-  const db = await getDb();
+  const _db = await getDb();
   let dbSubs = [];
-  if (db) dbSubs = await db.collection("subscribers").find().toArray();
+  if (_db) dbSubs = await _db.collection("subscribers").find().toArray();
 
   // Map real UEs from AMF and inject metrics if connected
   const allUes = realUes.map(u => ({
@@ -92,6 +100,7 @@ app.get("/api/ue", async (req, res) => {
         supi: imsi,
         cm_state: isConnected ? "connected" : "idle",
         pdu_sessions_count: isConnected ? 1 : 0,
+        slice: sub.slice || [{ sst: sub.sst || 1, sd: sub.sd || "ffffff" }],
         metrics: isConnected ? getSimulatedMetrics(sub.imsi) : null,
         isSimulated: true
       });
@@ -108,56 +117,102 @@ app.get("/api/metrics/history", (req, res) => {
 
 // GET /api/gnb — Hybrid: Real AMF gNBs + Simulated gNB
 app.get("/api/gnb", async (req, res) => {
+  let realGnbs = [];
   try {
     const resp = await axios.get(`${AMF_BASE}/gnb-info`, { timeout: 1000 });
-    res.json({ data: resp.data, source: "live-core" });
-  } catch (err) {
-    const simGnb = [{ gnb_id: "00101", name: "C-RAN-SITE-01", state: "active", ues: 1 }];
-    res.json({ data: { items: simGnb }, source: "simulated-gnb" });
+    realGnbs = resp.data.items || [];
+  } catch (err) {}
+
+  if (realGnbs.length === 0) {
+    const _db = await getDb();
+    let subCount = 0;
+    if (_db) subCount = await _db.collection("subscribers").countDocuments();
+    
+    const simGnb = [{
+      gnb_id: "00101",
+      name: "C-RAN-SITE-01",
+      state: "active",
+      num_connected_ues: subCount || 1,
+      plmn: "00101",
+      ng: { setup_success: true },
+      supported_ta_list: [{ tac: "000001", bplmns: [{ snssai: [{ sst: 1, sd: "ffffff" }] }] }]
+    }];
+    return res.json({ data: { items: simGnb, count: 1 }, source: "simulated-gnb" });
   }
+
+  res.json({ data: { items: realGnbs, count: realGnbs.length }, source: "live-core" });
 });
 
 // GET /api/pdu — Hybrid: Real SMF PDUs + Simulated sessions
 app.get("/api/pdu", async (req, res) => {
+  let realUes = [];
   try {
-    const resp = await axios.get(`${SMF_BASE}/pdu-info`, { timeout: 1000 });
-    res.json({ data: resp.data, source: "live-core" });
-  } catch (err) {
-    res.json({ data: { items: [] }, source: "simulated-pdu" });
-  }
+    const resp = await axios.get(`${AMF_BASE}/ue-info`, { timeout: 1000 });
+    realUes = resp.data.items || [];
+  } catch (err) {}
+
+  const _db = await getDb();
+  let dbSubs = [];
+  if (_db) dbSubs = await _db.collection("subscribers").find().toArray();
+
+  const allUes = realUes.map(u => ({ ...u }));
+  const realImsis = new Set(realUes.map(u => u.supi));
+
+  dbSubs.forEach((sub, idx) => {
+    const imsi = `imsi-${sub.imsi}`;
+    if (!realImsis.has(imsi)) {
+      // Extract IP from DB if available (Open5GS WebUI stores it in slice[0].session[0].ue.ipv4 or similar)
+      const dbIp = sub.slice?.[0]?.session?.[0]?.ue?.ipv4 || sub.slice?.[0]?.session?.[0]?.ue?.addr;
+      const finalIp = (dbIp && dbIp !== "0.0.0.0") ? dbIp : `10.45.0.${10 + idx}`;
+      
+      allUes.push({
+        supi: imsi,
+        cm_state: "connected",
+        pdu: [{
+          psi: 1,
+          dnn: sub.slice?.[0]?.session?.[0]?.name || "internet",
+          ipv4: finalIp,
+          pdu_state: "active",
+          snssai: sub.slice?.[0] || { sst: sub.sst || 1, sd: sub.sd || "ffffff" },
+          qos_flows: [{ "5qi": sub.slice?.[0]?.session?.[0]?.qos?.index || 9 }]
+        }],
+        ue_activity: "active"
+      });
+    }
+  });
+
+  res.json({ data: { items: allUes, count: allUes.length }, source: "hybrid-pdu" });
 });
 
 // GET /api/subscribers — Direct from MongoDB
 app.get("/api/subscribers", async (req, res) => {
-  const db = await getDb();
-  if (!db) return res.status(530).json({ error: "Mongo Offline" });
-  const subs = await db.collection("subscribers").find().toArray();
+  const _db = await getDb();
+  if (!_db) return res.status(530).json({ error: "Mongo Offline" });
+  const subs = await _db.collection("subscribers").find().toArray();
   res.json({ data: subs });
 });
 
 // POST /api/subscribers — OFFICIAL OPEN5GS NESTED SCHEMA
 app.post("/api/subscribers", async (req, res) => {
-  const db = await getDb();
-  if (!db) return res.status(530).json({ error: "Mongo Offline" });
+  console.log(`[PROVISION] Request received for IMSI: ${req.body.imsi}`);
+  const _db = await getDb();
+  if (!_db) return res.status(530).json({ error: "Mongo Offline" });
   
-  const { imsi, k, opc, sst, sd } = req.body;
+  const imsi = String(req.body.imsi).trim();
+  const { k, opc, sst, sd } = req.body;
   
-  // Official Open5GS nested structure
   const subscriberDoc = {
     imsi: imsi,
     msisdn: [],
     imeisv: "4370816125816151",
     security: {
-      k: k || "8baf473f2f8fd09487cccbd7097c6862",
+      k: (String(k || "8baf473f2f8fd09487cccbd7097c6862")).trim(),
       op: null,
-      opc: opc || "8e27b6af0e692e750f32667a3b14605d",
+      opc: (String(opc || "8e27b6af0e692e750f32667a3b14605d")).trim(),
       amf: "8000",
       sqn: 128
     },
-    ambr: {
-      downlink: { value: 1, unit: 3 },
-      uplink: { value: 1, unit: 3 }
-    },
+    ambr: { downlink: { value: 1, unit: 3 }, uplink: { value: 1, unit: 3 } },
     slice: [
       {
         sst: parseInt(sst) || 1,
@@ -182,20 +237,73 @@ app.post("/api/subscribers", async (req, res) => {
   };
 
   try {
-    await db.collection("subscribers").insertOne(subscriberDoc);
+    const result = await _db.collection("subscribers").insertOne(subscriberDoc);
+    console.log(`[PROVISION] SUCCESS: ${imsi} (ID: ${result.insertedId})`);
     addLog("UDM", `SDM: Subscriber Data Management initialized for ${imsi}`);
     addLog("AMF", `NAS: Registration Accept for UE ${imsi}`);
     res.json({ success: true });
   } catch (err) {
+    console.error(`[PROVISION] ERROR: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.delete("/api/subscribers/:imsi", async (req, res) => {
-  const db = await getDb();
-  if (db) await db.collection("subscribers").deleteOne({ imsi: req.params.imsi });
-  addLog("UDM", `SDM: Subscriber ${req.params.imsi} purged from UDR`);
+  const imsi = String(req.params.imsi).trim();
+  console.log(`[PURGE] Request received for IMSI: ${imsi}`);
+  const _db = await getDb();
+  if (_db) {
+    try {
+      const result = await _db.collection("subscribers").deleteOne({ imsi: imsi });
+      console.log(`[PURGE] Deleted count: ${result.deletedCount} for IMSI: ${imsi}`);
+      if (result.deletedCount === 0) {
+        console.warn(`[PURGE] WARNING: No document found with IMSI: ${imsi}`);
+      }
+    } catch (err) {
+      console.error(`[PURGE] DATABASE ERROR: ${err.message}`);
+    }
+  }
+  addLog("UDM", `SDM: Subscriber ${imsi} purged from UDR`);
   res.json({ success: true });
+});
+
+app.put("/api/subscribers/:imsi", async (req, res) => {
+  const imsi = String(req.params.imsi).trim();
+  console.log(`[UPDATE] Request received for IMSI: ${imsi}`);
+  const _db = await getDb();
+  if (!_db) return res.status(530).json({ error: "Mongo Offline" });
+
+  const { k, opc, sst, sd } = req.body;
+  const updateData = {
+    "security.k": k,
+    "security.opc": opc,
+    "slice": [{
+      sst: parseInt(sst) || 1,
+      sd: sd || "ffffff",
+      default_indicator: true,
+      session: [{
+        name: "internet",
+        type: 3,
+        qos: { index: 9, arp: { priority_level: 8, pre_emption_capability: 1, pre_emption_vulnerability: 1 } },
+        ambr: { downlink: { value: 1, unit: 3 }, uplink: { value: 1, unit: 3 } },
+        ue: { addr: "0.0.0.0" },
+        smf: { addr: "0.0.0.0" }
+      }]
+    }]
+  };
+
+  try {
+    const result = await _db.collection("subscribers").updateOne(
+      { imsi: imsi },
+      { $set: updateData }
+    );
+    console.log(`[UPDATE] Modified count: ${result.modifiedCount} for IMSI: ${imsi}`);
+    addLog("UDM", `SDM: Subscriber ${imsi} updated in UDR`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[UPDATE] ERROR: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/logs — Live Core Logs

@@ -19,10 +19,25 @@ export default function SlicePanel() {
         };
 
         ues.forEach(ue => {
-          const sliceKey = "1-ffffff"; // Defaulting simulation
+          // Try to get slice from UE location or PDU sessions if available
+          const sst = ue.slice?.[0]?.sst || (ue.pdu?.[0]?.snssai?.sst) || 1;
+          const sd = ue.slice?.[0]?.sd || (ue.pdu?.[0]?.snssai?.sd) || "ffffff";
+          const sliceKey = `${sst}-${sd}`;
+
           if (slicesMap[sliceKey]) {
             slicesMap[sliceKey].ues++;
             if (ue.metrics) slicesMap[sliceKey].traffic += parseFloat(ue.metrics.throughput_dl);
+          } else {
+            // Add dynamic slice if not predefined
+            const sstMap = { 1: "eMBB", 2: "URLLC", 3: "MIoT" };
+            slicesMap[sliceKey] = { 
+              sst, 
+              sd, 
+              name: sstMap[sst] ? `${sstMap[sst]} (Dynamic)` : `Slice ${sst}/${sd}`, 
+              ues: 1, 
+              color: "bg-slate-500", 
+              traffic: ue.metrics ? parseFloat(ue.metrics.throughput_dl) : 0 
+            };
           }
         });
 
