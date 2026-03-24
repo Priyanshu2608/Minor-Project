@@ -51,7 +51,7 @@ While our dashboard provides custom analytics, we've integrated your **Grafana (
 
 ---
 
-## 4. How to Demo (Script for your Professor)
+## 4. How to Demo
 
 1.  **Introduction**: "This is a 5G Core Management Dashboard. It's connected to a live Open5GS core running in Docker."
 2.  **The Dashboard**: "On the main screen, you can see our 'Pro Monitor'. It's currently tracking active radio links and downlink/uplink throughput. Those trend charts are updating every 2 seconds via our custom proxy."
